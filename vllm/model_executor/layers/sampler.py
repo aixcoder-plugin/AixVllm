@@ -92,6 +92,8 @@ class SamplerOutput(
     # On-device tensor containing the logprobs of each token.
     logprobs: Optional["torch.Tensor"] = None
 
+    probs: Optional["torch.Tensor"] = None
+
     # Holds either (1) the pythonized sampler result (single-step scheduling)
     # or (2) what will be arguments for later deferred pythonization of the
     # sampler result (muliti-step scheduling)
@@ -305,13 +307,15 @@ class Sampler(nn.Module):
             prompt_logprobs, sample_logprobs = get_logprobs(
                 logprobs, sampling_metadata, maybe_deferred_sample_results)
 
-        return _build_sampler_output(
+        __out: SamplerOutput = _build_sampler_output(
             maybe_deferred_sample_results,
             sampling_metadata,
             prompt_logprobs,
             sample_logprobs,
             on_device_tensors=on_device_tensors,
             skip_sampler_cpu_output=sampling_metadata.skip_sampler_cpu_output)
+        __out.probs = probs
+        return __out
 
     @property
     def _should_modify_greedy_probs_inplace(self) -> bool:

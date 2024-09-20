@@ -40,6 +40,7 @@ class Logprob:
     logprob: float
     rank: Optional[int] = None
     decoded_token: Optional[str] = None
+    ori_logprob: Optional[float] = None
 
 
 # {token_id -> logprob} per each sequence group. None if the corresponding
