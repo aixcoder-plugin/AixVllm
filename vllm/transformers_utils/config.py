@@ -1,4 +1,5 @@
 import contextlib
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, Union
 
@@ -53,6 +54,7 @@ def get_config(
     code_revision: Optional[str] = None,
     rope_scaling: Optional[dict] = None,
     rope_theta: Optional[float] = None,
+    aix_model_config: Union[Dict, None] = None,
     **kwargs,
 ) -> PretrainedConfig:
 
@@ -63,12 +65,15 @@ def get_config(
         model = Path(model).parent
 
     try:
-        config = AutoConfig.from_pretrained(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            code_revision=code_revision,
-            **kwargs)
+        if not os.path.exists(os.path.join(model, "config.json")) and isinstance(aix_model_config, dict):
+            config = PretrainedConfig.from_dict(aix_model_config)
+        else:
+            config = AutoConfig.from_pretrained(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                code_revision=code_revision,
+                **kwargs)
     except ValueError as e:
         if (not trust_remote_code and
                 "requires you to execute the configuration file" in str(e)):

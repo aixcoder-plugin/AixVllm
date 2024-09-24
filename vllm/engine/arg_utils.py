@@ -763,7 +763,7 @@ class EngineArgs:
         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
         return engine_args
 
-    def create_engine_config(self) -> EngineConfig:
+    def create_engine_config(self, aix_model_config: Union[Dict, None] = None) -> EngineConfig:
         # gguf file needs a specific model loader and doesn't use hf_repo
         if check_gguf_file(self.model):
             self.quantization = self.load_format = "gguf"
@@ -813,7 +813,8 @@ class EngineArgs:
             served_model_name=self.served_model_name,
             limit_mm_per_prompt=self.limit_mm_per_prompt,
             use_async_output_proc=not self.disable_async_output_proc,
-            override_neuron_config=self.override_neuron_config)
+            override_neuron_config=self.override_neuron_config,
+            aix_model_config=aix_model_config)
         cache_config = CacheConfig(
             block_size=self.block_size if self.device != "neuron" else
             self.max_model_len,  # neuron needs block_size = max_model_len
