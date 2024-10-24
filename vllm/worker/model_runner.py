@@ -913,6 +913,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
 
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
+        if self.model_config.with_ladder:
+            logger.info("Starting to load ladder model %s...", self.model_config.ladder_model_path)
         with CudaMemoryProfiler() as m:
             self.model = get_model(model_config=self.model_config,
                                    device_config=self.device_config,
@@ -1447,7 +1449,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
-        hidden_or_intermediate_states = model_executable(
+        hidden_or_intermediate_states, ladder_hidden_states = model_executable(
             input_ids=model_input.input_tokens,
             positions=model_input.input_positions,
             kv_caches=kv_caches,
@@ -1456,7 +1458,6 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             **MultiModalInputs.as_kwargs(multi_modal_kwargs,
                                          device=self.device),
             **seqlen_agnostic_kwargs)
-
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
             model_forward_end.record()
@@ -1482,6 +1483,13 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         logits = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
+        
+        if ladder_hidden_states != None:
+            ladder_logits = self.model.compute_ladder_logits(ladder_hidden_states.to(hidden_or_intermediate_states.dtype))        
+            logits = ladder_logits.unsqueeze(0) if \
+                torch.max(torch.softmax(ladder_logits.float(), dim=-1)) >= \
+                torch.max(torch.softmax(logits.float(), dim=-1)) \
+                    else logits
 
         if not self.is_driver_worker:
             return []

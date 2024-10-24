@@ -34,6 +34,7 @@ from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
+                                               ColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -49,10 +50,100 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, kv_cache_scales_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
-from vllm.utils import is_hip
+from vllm.utils import is_hip, AixQkvWeightHelper
 
 from .interfaces import SupportsLoRA
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
+
+# ==========================================================================================
+# Yocto : support ladder net
+
+# class RMSNorm(torch.nn.Module):
+#     def __init__(self, dim: int, eps: float = 1e-6):
+#         super().__init__()
+#         self.eps = eps
+#         self.weight = torch.nn.Parameter(torch.ones(dim))
+
+#     def _norm(self, x):
+#         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+#     def forward(self, x):
+#         output = self._norm(x.float()).type_as(x)
+#         return output * self.weight
+
+def dropout_add(x, residual, prob, training):
+    # type: (torch.Tensor, torch.Tensor, float, bool) -> torch.Tensor
+    out = torch.nn.functional.dropout(x, p=prob, training=training)
+    out = residual + out
+    return out
+
+# @torch.jit.script
+def dropout_add_fused_inference(x: torch.Tensor,
+                                residual: torch.Tensor,
+                                prob: float) -> torch.Tensor:
+    return dropout_add(x, residual, prob, False)
+
+class ParallelGatedLinearUnit(torch.nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(ParallelGatedLinearUnit, self).__init__()
+
+        feed_forward_dim = int(int(out_dim/(3*4)) * 4)
+
+        self.dense_1 = ColumnParallelLinear(
+            in_dim,
+            feed_forward_dim,
+            gather_output=False,
+            skip_bias_add=True,
+            bias=False,
+        )
+        self.dense_2 = ColumnParallelLinear(
+            in_dim,
+            feed_forward_dim,
+            gather_output=False,
+            skip_bias_add=True,
+            bias=False,
+        )
+        self.dense_3 = RowParallelLinear(
+            feed_forward_dim,
+            out_dim,
+            input_is_parallel=True,
+            skip_bias_add=True,
+            bias=False,
+        )
+        self.activation = torch.nn.SiLU()
+    
+    def forward(self, hidden_state):
+        part_one, _ = self.dense_1(hidden_state)
+        part_one = self.activation(part_one)
+        part_two, _ = self.dense_2(hidden_state)
+
+        hidden_state, _ = self.dense_3(torch.multiply(part_one, part_two))
+        return hidden_state
+
+class LlamaLadderLayer(nn.Module):
+    
+    def __init__(
+        self,
+        config: LlamaConfig,
+    ) -> None:
+        super().__init__()
+        self.input_norm = RMSNorm(config.hidden_size,
+                                  eps=config.rms_norm_eps)
+        self.feed_forward = ParallelGatedLinearUnit(
+            in_dim=4096, out_dim=4096
+        )
+        self.merge_gates = nn.Parameter(torch.ones(1))
+    
+    def forward(self, hidden_states):
+        residual = hidden_states
+        hidden_states = self.input_norm(hidden_states).to(hidden_states.dtype)
+        
+        hidden_states = self.feed_forward(hidden_states)
+        hidden_states = dropout_add_fused_inference(hidden_states, residual=residual, prob=0)
+        
+        return hidden_states
+
+# ==========================================================================================
 
 
 class LlamaMLP(nn.Module):
@@ -177,9 +268,16 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # debug_list.append({"q":q.clone().detach()})
+        # debug_list.append({"k":k.clone().detach()})
+        # debug_list.append({"v":v.clone().detach()})
         q, k = self.rotary_emb(positions, q, k)
+        # debug_list.append({"rotary_emb_q":q.clone().detach()})
+        # debug_list.append({"rotary_emb_k":k.clone().detach()})
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        # debug_list.append({"attn_output":attn_output.clone().detach()})
         output, _ = self.o_proj(attn_output)
+        # debug_list.append({"o_proj_output":output.clone().detach()})
         return output
 
 
@@ -242,23 +340,40 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        # debug_list = []
+        # debug_list.append({"layer_norm_input" : hidden_states.clone().detach()})
+        # debug_list.append({"residual is None" : residual is None})
+        # debug_list.append({"layer_norm_weight" : self.input_layernorm.weight})
+        # debug_list.append({"layer_norm_eps" : self.input_layernorm.variance_epsilon})
+        
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+        # debug_list.append({"layer_norm_output" : hidden_states.clone().detach()})
+        
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
+        # for item in attn_debug_list:
+        #     debug_list.append(item)
+        # debug_list.append({"attention_output" : hidden_states.clone().detach()})
 
+        
         # Fully Connected
+        # debug_list.append({"post_attention_norm_input" : hidden_states.clone().detach()})
+        # debug_list.append({"post_attention_norm_input_res" : residual.clone().detach()})
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+        # debug_list.append({"post_attention_norm_output" : hidden_states.clone().detach()})
         hidden_states = self.mlp(hidden_states)
+        # debug_list.append({"mlp_output" : hidden_states.clone().detach()})
+        # return hidden_states, residual, debug_list
         return hidden_states, residual
 
 
@@ -271,6 +386,8 @@ class LlamaModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
         prefix: str = "",
+        with_ladder: Optional[bool] = False,
+        sub_layers_ids: Optional[List[int]] = [],
     ) -> None:
         super().__init__()
         self.config = config
@@ -300,6 +417,20 @@ class LlamaModel(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+# ==========================================================================================
+        # Yocto : support ladder net
+        # TODO(Yocto) : remove this hack
+        self.with_ladder = with_ladder
+        if self.with_ladder:
+            self.sub_layers_ids = sub_layers_ids
+            self.input_scaler = ParallelGatedLinearUnit(in_dim=4096, out_dim=4096)
+            self.output_layer = ParallelGatedLinearUnit(in_dim=4096, out_dim=4096)
+            self.ladder_layers = torch.nn.ModuleList([LlamaLadderLayer(self.config) for _ in range(len(self.sub_layers_ids))])
+            self.finnal_norm = RMSNorm(4096)
+            self.sigmoid = torch.nn.Sigmoid()
+            self.activation_func = torch.nn.SiLU()
+# ==========================================================================================
+
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -313,6 +444,9 @@ class LlamaModel(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        # debug_tensor = {}
+        stem_hidden_state = None
+        # debug_tensor["input_ids"] = input_ids.clone().detach().int()
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -323,9 +457,16 @@ class LlamaModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        ladder_hidden_states = None
+        # debug_tensor.append({"embd_output" : hidden_states.clone().detach()})
+        # debug_tensor.append({"residual" : residual})
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            # hidden_list.append({"layer_id" : i})
+            # hidden_list.append({"layer" : layer})
+            # hidden_list.append({"hidden_states" : hidden_states})
+            # hidden_list.append({"residual" : residual})
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -333,15 +474,41 @@ class LlamaModel(nn.Module):
                 attn_metadata,
                 residual,
             )
+            if self.with_ladder:
+                if i in self.sub_layers_ids:
+                    # debug_tensor['hidden_states'] = hidden_states.clone().detach()
+                    # debug_tensor['residual'] = residual.clone().detach()
+                    stem_hidden_state = hidden_states[-1].clone().contiguous() + residual[-1].clone().contiguous()
+                    if i == 0:
+                        # debug_tensor['layer_norm_input'] = stem_hidden_state.clone().detach()
+                        ladder_hidden_states = self.input_scaler(stem_hidden_state)
+                        # debug_tensor['layer_norm_output'] = ladder_hidden_states.clone().detach()
+                    else:
+                        # debug_tensor[f'layer_{i}_input'] = ladder_hidden_states.clone().detach()
+                        ladder_layer = self.ladder_layers[self.sub_layers_ids.index(i) - 1]
+                        gate_value = self.sigmoid(ladder_layer.merge_gates)
+                        # debug_tensor[f'layer_{i}_gate_value'] = gate_value.clone().detach()
+                        # debug_tensor[f'layer_{i}_stem_hidden_state'] = stem_hidden_state.clone().detach()
+                        merged = torch.add(stem_hidden_state * gate_value, ladder_hidden_states * (1 - gate_value))
+                        # debug_tensor[f'layer_{i}_merged'] = merged.clone().detach()
+                        ladder_hidden_states = ladder_layer(merged)
+                        # debug_tensor[f'layer_{i}_output'] = ladder_hidden_states.clone().detach()
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
+        # debug_tensor["ladder_hidden_states"] = ladder_hidden_states.clone().detach()
 
+        if self.with_ladder:
+            ladder_hidden_states = self.activation_func(ladder_hidden_states)
+            ladder_hidden_states = self.output_layer(ladder_hidden_states)
+            ladder_hidden_states = self.finnal_norm(ladder_hidden_states)
+            
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        
+        return hidden_states, ladder_hidden_states
 
 
 class LlamaForCausalLM(nn.Module, SupportsLoRA):
@@ -382,6 +549,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
+        with_ladder: Optional[bool] = False,
+        sub_layers_ids:Optional[List[int]] = [],
     ) -> None:
         super().__init__()
 
@@ -392,7 +561,9 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
                                 cache_config,
                                 quant_config,
                                 lora_config=lora_config,
-                                prefix="model")
+                                prefix="model",
+                                with_ladder=with_ladder,
+                                sub_layers_ids=sub_layers_ids)
         if get_pp_group().is_last_rank:
             self.unpadded_vocab_size = config.vocab_size
             if lora_config:
@@ -426,9 +597,9 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        model_output = self.model(input_ids, positions, kv_caches,
+        model_output, ladder_hidden_states = self.model(input_ids, positions, kv_caches,
                                   attn_metadata, intermediate_tensors)
-        return model_output
+        return model_output, ladder_hidden_states
 
     def compute_logits(
         self,
@@ -438,6 +609,15 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits
+
+# ==========================================================================================
+    def compute_ladder_logits(
+        self,
+        ladder_hidden_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        ladder_logits = torch.nn.functional.linear(ladder_hidden_states, self.lm_head.weight)
+        return ladder_logits
+# ==========================================================================================
 
     def sample(
         self,
@@ -460,6 +640,103 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
                         dtype=dtype,
                         device=device),
         })
+
+    def load_weights_with_ladder(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        qkv_weight_helper = AixQkvWeightHelper(self)
+        params_dict = dict(self.named_parameters())
+        weight_dtype = params_dict[next(iter(params_dict.keys()))]
+        for name, loaded_weight in weights:
+            # if name == 'tok_embeddings.weight':
+            #     source_name = 'model.embed_tokens.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+            #     params_dict[source_name].data = loaded_weight.cuda()
+            # elif name == 'output.weight':
+            #     source_name = 'lm_head.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+            #     params_dict[source_name].data = loaded_weight.cuda()
+            # elif name == 'norm.weight':
+            #     source_name = 'model.norm.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+            #     params_dict[source_name].data = loaded_weight.cuda()
+            # elif name.startswith('layers.') and name.endswith('attention.query_key_value.weight'):
+            #     layer_id = name.split('.')[1]
+            #     source_name = 'model.layers.' + layer_id + '.self_attn.qkv_proj.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+            #     loaded_weight = qkv_weight_helper.permute_qkv_weights(source_name, loaded_weight)
+            #     params_dict[source_name].data = loaded_weight.cuda()
+            # elif name.startswith('layers.') and name.endswith('feed_forward.w1.weight'):
+            #     layer_id = name.split('.')[1]
+            #     source_name = 'model.layers.' + layer_id + '.mlp.gate_up_proj.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name][:14464].shape == loaded_weight.shape, f"{name} shape error"
+            #     (params_dict[source_name].data)[:14464]  = loaded_weight.cuda()
+            # elif name.startswith('layers.') and name.endswith('feed_forward.w3.weight'):
+            #     layer_id = name.split('.')[1]
+            #     source_name = 'model.layers.' + layer_id + '.mlp.gate_up_proj.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name][14464:].shape == loaded_weight.shape, f"{name} shape error"
+            #     (params_dict[source_name].data)[14464:]  = loaded_weight.cuda()
+            # elif name.startswith('layers.') and name.endswith('attention.wo.weight'):
+            #     layer_id = name.split('.')[1]
+            #     source_name = 'model.layers.' + layer_id + '.self_attn.o_proj.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+            #     params_dict[source_name].data = loaded_weight.cuda()
+            # elif name.startswith('layers.') and name.endswith('feed_forward.w2.weight'):
+            #     layer_id = name.split('.')[1]
+            #     source_name = 'model.layers.' + layer_id + '.mlp.down_proj.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+            #     params_dict[source_name].data = loaded_weight.cuda()
+            # elif name.startswith('layers.') and name.endswith('attention_norm.weight'):
+            #     layer_id = name.split('.')[1]
+            #     source_name = 'model.layers.' + layer_id + '.input_layernorm.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+            #     params_dict[source_name].data = loaded_weight.cuda()
+            # elif name.startswith('layers.') and name.endswith('ffn_norm.weight'):
+            #     layer_id = name.split('.')[1]
+            #     source_name = 'model.layers.' + layer_id + '.post_attention_layernorm.weight'
+            #     assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+            #     assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+            #     params_dict[source_name].data = loaded_weight.cuda()
+            if name == 'merge_gates':
+                for layer_id in range(loaded_weight.shape[0]):
+                    source_name = 'model.ladder_layers.' + str(layer_id) + '.merge_gates'
+                    assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+                    assert params_dict[source_name].shape == loaded_weight[layer_id].unsqueeze(0).shape, f"{name} shape error"
+                    params_dict[source_name].data = loaded_weight[layer_id].unsqueeze(0).cuda()
+            elif name.startswith("input_scaler"):
+                source_name = 'model.' + name
+                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+                params_dict[source_name].data = loaded_weight.to(weight_dtype).cuda()
+            elif name.startswith('layers.') and 'feed_forward.dense' in name:
+                source_name = 'model.ladder_' + name
+                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+                params_dict[source_name].data = loaded_weight.cuda()
+            elif name.startswith('layers.') and 'input_norm.weight' in name:
+                source_name = 'model.ladder_' + name
+                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+                params_dict[source_name].data = loaded_weight.cuda()
+            elif name.startswith('output_layer'):
+                source_name = 'model.' + name
+                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+                params_dict[source_name].data = loaded_weight.cuda()
+            elif name == 'finnal_norm.weight':
+                source_name = 'model.' + name
+                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
+                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
+                params_dict[source_name].data = loaded_weight.cuda()
+            else:
+                raise ValueError(f"key {name} error.")
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -524,7 +801,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
-
+        
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state

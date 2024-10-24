@@ -407,6 +407,7 @@ def pt_weights_iterator(
     """Iterate over the weights in the model bin/pt files."""
     enable_tqdm = not torch.distributed.is_initialized(
     ) or torch.distributed.get_rank() == 0
+
     for bin_file in tqdm(
             hf_weights_files,
             desc="Loading pt checkpoint shards",

@@ -1224,3 +1224,99 @@ async def _run_task_with_lock(task: Callable, lock: asyncio.Lock, *args,
 def supports_dynamo() -> bool:
     base_torch_version = Version(Version(torch.__version__).base_version)
     return base_torch_version >= Version("2.4.0")
+
+def split(v: Union[np.ndarray, torch.Tensor],
+          tp_size: int,
+          tp_rank: int,
+          dim=0):
+    if tp_size == 1:
+        return v
+    assert len(v.shape) > 1 or dim == 0
+    if isinstance(v, np.ndarray):
+        return np.ascontiguousarray(
+            np.split(v, tp_size, axis=dim)[tp_rank].copy())
+    else:
+        assert v.shape[dim] % tp_size == 0, \
+            'Unable to split: shape={v.shape} (dim={dim}) tp_size={tp_size}.'
+        split_size = v.shape[dim] // tp_size
+        return v.split(split_size, dim=dim)[tp_rank].clone().detach()
+
+# Yocto
+def dup_kv_weight(v, num_head, tp_size):
+    assert tp_size % num_head == 0
+    reps = tp_size // num_head
+    head_size = v.shape[0] // num_head
+    v = v.reshape(num_head, head_size,
+                  -1)[:, None, :, :].expand(num_head, reps, head_size,
+                                            v.shape[1])
+    return v.reshape(num_head * reps * head_size, -1).clone().detach()
+
+# Yocto
+class AixQkvWeightHelper:
+    """ A helper utility for loading QKV weights from single files. """
+
+    def __init__(self, model):
+        self.hidden_size = 4096
+        self.num_heads = 32
+        self.num_kv_heads = 8
+        self.tp_size = 1
+        self.tp_rank = 0
+        self.is_mha = self.num_heads == self.num_kv_heads
+
+    @staticmethod
+    def is_qkv_weight(name):
+        if "attention.query_key_value.weight" in name:
+            return True
+        return False
+
+    def permute_qkv_weights(self, name, param):
+        """
+            name: layers.0.attention.query_key_value.weight
+            param's shape: [6144, 4096]
+            param's permutation: 
+                - [qqqqkkvv qqqqkkvv] for np(heads per local)=2, kvnp(kv heads per local)=1, hn(hidden_size per head)=4, hidden_size=8
+                - [group_size, num_of_query_local_heads_in_each_group + 1 + 1, head_dim, hidden_size] => [(num_of_heads + num_of_kv_heads * 2) * head_dim, hidden_size]
+
+        """
+        
+        # TODO: now, only work for aix3-7B
+        assert self.num_kv_heads == 8
+        assert self.num_heads == 32
+        assert self.hidden_size == 4096
+        assert self.is_mha == False
+
+        assert param.shape[0] == (self.num_kv_heads *2) * self.hidden_size//self.num_heads + self.hidden_size
+        assert param.shape[1] == self.hidden_size
+        
+
+        if not self.is_mha:
+            head_size = self.hidden_size // self.num_heads
+            param = param.reshape(self.num_kv_heads, self.num_heads // self.num_kv_heads + 2, head_size, self.hidden_size)
+
+            # w_q.shape (8, 4, 128, 4096)
+            # w_kv.shape (8, 2, 128, 4096)
+            w_q, w_kv = torch.split(param, self.num_heads // self.num_kv_heads, dim=1)
+            w_k = torch.clone(w_kv[:, 0:1, :, :])
+            w_v = torch.clone(w_kv[:, 1:2, :, :])
+
+            if self.num_kv_heads < self.tp_size:
+                # duplicate the KV heads up to tensor_parallel
+                w_k = dup_kv_weight(w_k, self.num_kv_heads, self.tp_size)
+                v = dup_kv_weight(v, self.num_kv_heads, self.tp_size)
+            
+            w_q = torch.reshape(w_q, [self.hidden_size, self.hidden_size])
+            w_k = torch.reshape(w_k, [self.num_kv_heads * head_size, self.hidden_size])
+            w_v = torch.reshape(w_v, [self.num_kv_heads * head_size, self.hidden_size])
+            assert w_k.shape[0] % (self.tp_size * head_size) == 0, f"w_k.shape: {w_k.shape}, self.tp_size: {self.tp_size}, head_size: {head_size}"
+            assert w_v.shape[0] % (self.tp_size * head_size) == 0, f"w_v.shape: {w_v.shape}, self.tp_size: {self.tp_size}, head_size: {head_size}"
+            wq = split(w_q, self.tp_size, self.tp_rank)
+            wk = split(w_k, self.tp_size, self.tp_rank)
+            wv = split(w_v, self.tp_size, self.tp_rank)
+            fused_qkv = torch.cat((wq, wk, wv), dim=0)
+        else:
+            qkv = param
+            qkv = qkv.reshape(3, self.hidden_size, self.hidden_size)
+            fused_qkv = split(qkv, self.tp_size, self.tp_rank, dim=1)
+            fused_qkv = fused_qkv.reshape(3 * (self.hidden_size // self.tp_size),
+                                          self.hidden_size)
+        return fused_qkv
