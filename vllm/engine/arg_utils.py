@@ -1,7 +1,7 @@
 import argparse
 import dataclasses
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple,
                     Type, Union)
 
@@ -26,6 +26,8 @@ logger = init_logger(__name__)
 
 ALLOWED_DETAILED_TRACE_MODULES = ["model", "worker", "all"]
 
+def parse_list_of_ints(string):
+    return json.loads(string) if string else []
 
 def nullable_str(val: str):
     if not val or val == "None":
@@ -58,6 +60,9 @@ def nullable_kvs(val: str) -> Optional[Mapping[str, int]]:
 class EngineArgs:
     """Arguments for vLLM engine."""
     model: str = 'facebook/opt-125m'
+    with_ladder : bool = False
+    ladder_model_path : str = ""
+    sub_layers_ids : Optional[List[int]] = field(default_factory=list)
     served_model_name: Optional[Union[str, List[str]]] = None
     tokenizer: Optional[str] = None
     skip_tokenizer_init: bool = False
@@ -165,6 +170,27 @@ class EngineArgs:
             type=str,
             default=EngineArgs.model,
             help='Name or path of the huggingface model to use.')
+        # --------------------------------------------------------------------------------
+        # Yocto : add two argument to support ladder net
+        parser.add_argument(
+            '--with-ladder', 
+            action='store_true',
+            help="Flag to indicate if the model has undergone domain-specific training."
+        )
+        parser.add_argument(
+            '--ladder-model-path', 
+            type=str,
+            default='',
+            help="Path to the ladder model if domain-specific training is utilized."
+        )
+        parser.add_argument(
+            '--sub-layers-ids',
+            type=parse_list_of_ints,
+            default="",
+            help="When domain-adaptive training is activated, \
+                it is necessary to specify in which layers to insert auxiliary layers."
+        )
+        # --------------------------------------------------------------------------------
         parser.add_argument(
             '--tokenizer',
             type=nullable_str,
@@ -752,7 +778,6 @@ class EngineArgs:
             },
             default=None,
             help="override or set neuron device configuration.")
-
         return parser
 
     @classmethod
@@ -787,10 +812,12 @@ class EngineArgs:
         assert self.cpu_offload_gb >= 0, (
             "CPU offload space must be non-negative"
             f", but got {self.cpu_offload_gb}")
-
         device_config = DeviceConfig(device=self.device)
         model_config = ModelConfig(
             model=self.model,
+            with_ladder=self.with_ladder,
+            sub_layers_ids=self.sub_layers_ids,
+            ladder_model_path=self.ladder_model_path,
             tokenizer=self.tokenizer,
             tokenizer_mode=self.tokenizer_mode,
             trust_remote_code=self.trust_remote_code,

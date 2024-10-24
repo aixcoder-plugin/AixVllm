@@ -147,7 +147,9 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                 quant_config: Optional[QuantizationConfig], *,
                 lora_config: Optional[LoRAConfig],
                 multimodal_config: Optional[MultiModalConfig],
-                scheduler_config: Optional[SchedulerConfig]) -> nn.Module:
+                scheduler_config: Optional[SchedulerConfig],
+                with_ladder: Optional[bool],
+                sub_layers_ids: Optional[List[int]]) -> nn.Module:
     extra_kwargs = _get_model_initialization_kwargs(model_class, lora_config,
                                                     multimodal_config,
                                                     scheduler_config)
@@ -155,6 +157,8 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
     return model_class(config=hf_config,
                        cache_config=cache_config,
                        quant_config=quant_config,
+                       with_ladder=with_ladder,
+                       sub_layers_ids=sub_layers_ids,
                        **extra_kwargs)
 
 
@@ -166,6 +170,8 @@ def _initialize_model(
         scheduler_config: Optional[SchedulerConfig] = None) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    with_ladder = model_config.with_ladder
+    sub_layers_ids = model_config.sub_layers_ids
 
     return build_model(
         model_class,
@@ -175,6 +181,8 @@ def _initialize_model(
         lora_config=lora_config,
         multimodal_config=model_config.multimodal_config,
         scheduler_config=scheduler_config,
+        with_ladder=with_ladder,
+        sub_layers_ids=sub_layers_ids
     )
 
 
@@ -299,12 +307,17 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, model_name_or_path: str, revision: Optional[str],
+        self, model_name_or_path: str, 
+        with_ladder : bool, ladder_model_path : str,
+        revision: Optional[str],
         fall_back_to_pt: bool
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             model_name_or_path, revision, fall_back_to_pt)
+        if with_ladder:
+            hf_weights_files.append(os.path.join(ladder_model_path, 'CodeLST.pt'))
+        
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -341,13 +354,26 @@ class DefaultModelLoader(BaseModelLoader):
                 model = _initialize_model(model_config, self.load_config,
                                           lora_config, cache_config,
                                           scheduler_config)
-            model.load_weights(
-                self._get_weights_iterator(model_config.model,
-                                           model_config.revision,
-                                           fall_back_to_pt=getattr(
-                                               model,
-                                               "fall_back_to_pt_during_load",
-                                               True)), )
+            if model_config.with_ladder:
+                model.load_weights_with_ladder(
+                    self._get_weights_iterator(model_config.model,
+                                            model_config.with_ladder,
+                                            model_config.ladder_model_path,
+                                            model_config.revision,
+                                            fall_back_to_pt=getattr(
+                                                model,
+                                                "fall_back_to_pt_during_load",
+                                                True)), )
+            else:
+                model.load_weights(
+                    self._get_weights_iterator(model_config.model,
+                                            model_config.with_ladder,
+                                            model_config.ladder_model_path,
+                                            model_config.revision,
+                                            fall_back_to_pt=getattr(
+                                                model,
+                                                "fall_back_to_pt_during_load",
+                                                True)), )
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)

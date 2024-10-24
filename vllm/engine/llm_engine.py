@@ -301,7 +301,6 @@ class LLMEngine:
         self.input_registry = input_registry
         self.input_processor = input_registry.create_input_processor(
             model_config)
-
         self.model_executor = executor_class(
             model_config=model_config,
             cache_config=cache_config,
@@ -314,7 +313,6 @@ class LLMEngine:
             prompt_adapter_config=prompt_adapter_config,
             observability_config=self.observability_config,
         )
-
         if not self.model_config.embedding_mode:
             self._initialize_kv_caches()
 

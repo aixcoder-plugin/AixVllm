@@ -124,6 +124,9 @@ class ModelConfig:
     def __init__(
             self,
             model: str,
+            with_ladder : bool,
+            ladder_model_path : str,
+            sub_layers_ids: Optional[int],
             tokenizer: str,
             tokenizer_mode: str,
             trust_remote_code: bool,
@@ -150,6 +153,12 @@ class ModelConfig:
             override_neuron_config: Optional[Dict[str, Any]] = None,
             aix_model_config: Union[Dict, None] = None) -> None:
         self.model = model
+        # --------------------------------------------------------------------------------
+        # Yocto : add two argument to support ladder net
+        self.with_ladder = with_ladder 
+        self.ladder_model_path = ladder_model_path
+        self.sub_layers_ids = sub_layers_ids
+        # --------------------------------------------------------------------------------
         self.tokenizer = tokenizer
         self.tokenizer_mode = tokenizer_mode
         self.trust_remote_code = trust_remote_code
