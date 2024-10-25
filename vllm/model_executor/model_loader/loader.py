@@ -434,6 +434,133 @@ class TensorizerLoader(BaseModelLoader):
             self) -> Generator[Tuple[str, torch.Tensor], None, None]:
         tensorizer_args = self.tensorizer_config._construct_tensorizer_args()
         return tensorizer_weights_iterator(tensorizer_args)
+    
+    def _maybe_download_from_modelscope(
+            self, model: str, revision: Optional[str]) -> Optional[str]:
+        """Download model from ModelScope hub if VLLM_USE_MODELSCOPE is True.
+
+        Returns the path to the downloaded model, or None if the model is not
+        downloaded from ModelScope."""
+        if VLLM_USE_MODELSCOPE:
+            # download model from ModelScope hub,
+            # lazy import so that modelscope is not required for normal use.
+            # pylint: disable=C.
+            from modelscope.hub.snapshot_download import snapshot_download
+
+            if not os.path.exists(model):
+                model_path = snapshot_download(
+                    model_id=model,
+                    cache_dir=self.load_config.download_dir,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                    revision=revision,
+                    ignore_file_pattern=self.load_config.ignore_patterns,
+                )
+            else:
+                model_path = model
+            return model_path
+        return None
+    
+    def _prepare_weights(self, model_name_or_path: str,
+                         revision: Optional[str],
+                         fall_back_to_pt: bool) -> Tuple[str, List[str], bool]:
+        """Prepare weights for the model.
+
+        If the model is not local, it will be downloaded."""
+        model_name_or_path = self._maybe_download_from_modelscope(
+            model_name_or_path, revision) or model_name_or_path
+
+        is_local = os.path.isdir(model_name_or_path)
+        load_format = LoadFormat.PT
+        use_safetensors = False
+        # Some quantized models use .pt files for storing the weights.
+        if load_format == LoadFormat.AUTO:
+            allow_patterns = ["*.safetensors", "*.bin"]
+        elif load_format == LoadFormat.SAFETENSORS:
+            use_safetensors = True
+            allow_patterns = ["*.safetensors"]
+        elif load_format == LoadFormat.PT:
+            allow_patterns = ["*.pt"]
+        elif load_format == LoadFormat.NPCACHE:
+            allow_patterns = ["*.bin"]
+        else:
+            raise ValueError(f"Unknown load_format: {load_format}")
+
+        if fall_back_to_pt:
+            allow_patterns += ["*.pt"]
+
+        if not is_local:
+            hf_folder = download_weights_from_hf(
+                model_name_or_path,
+                self.load_config.download_dir,
+                allow_patterns,
+                revision,
+                ignore_patterns=self.load_config.ignore_patterns,
+            )
+        else:
+            hf_folder = model_name_or_path
+
+        hf_weights_files: List[str] = []
+        for pattern in allow_patterns:
+            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if len(hf_weights_files) > 0:
+                if pattern == "*.safetensors":
+                    use_safetensors = True
+                break
+
+        if use_safetensors:
+            # For models like Mistral-7B-Instruct-v0.3
+            # there are both sharded safetensors files and a consolidated
+            # safetensors file. Using both breaks.
+            # Here, we download the `model.safetensors.index.json` and filter
+            # any files not found in the index.
+            if not is_local:
+                download_safetensors_index_file_from_hf(
+                    model_name_or_path, self.load_config.download_dir,
+                    revision)
+            hf_weights_files = filter_duplicate_safetensors_files(
+                hf_weights_files, hf_folder)
+        else:
+            hf_weights_files = filter_files_not_needed_for_inference(
+                hf_weights_files)
+
+        if len(hf_weights_files) == 0:
+            raise RuntimeError(
+                f"Cannot find any model weights with `{model_name_or_path}`")
+
+        return hf_folder, hf_weights_files, use_safetensors
+
+    def _get_weights_iteratorV2(
+        self, model_name_or_path: str,
+        revision: Optional[str],
+        fall_back_to_pt: bool
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Get an iterator for the model weights based on the load format."""
+        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+            model_name_or_path, revision, fall_back_to_pt)
+        if self.load_config.load_format == LoadFormat.NPCACHE:
+            # Currently np_cache only support *.bin checkpoints
+            assert use_safetensors is False
+            weights_iterator = np_cache_weights_iterator(
+                model_name_or_path, self.load_config.download_dir, hf_folder,
+                hf_weights_files)
+        elif use_safetensors:
+            weights_iterator = safetensors_weights_iterator(hf_weights_files)
+        else:
+            weights_iterator = pt_weights_iterator(hf_weights_files)
+
+        if current_platform.is_tpu():
+            # In PyTorch XLA, we should call `xm.mark_step` frequently so that
+            # not too many ops are accumulated in the XLA program.
+            import torch_xla.core.xla_model as xm
+
+            def _xla_weights_iterator(iterator: Generator):
+                for weights in iterator:
+                    yield weights
+                    xm.mark_step()
+
+            weights_iterator = _xla_weights_iterator(weights_iterator)
+        return weights_iterator
+
 
     def _load_model_serialized_cpu(
         self,
@@ -484,7 +611,17 @@ class TensorizerLoader(BaseModelLoader):
                 tensorizer_config.hf_config = model_config.hf_config
                 tensorizer_config.dtype = model_config.dtype
 
-                model = load_with_tensorizer(tensorizer_config, **extra_kwargs)
+                model = load_with_tensorizer(tensorizer_config, model_config, **extra_kwargs)
+                
+                if model_config.with_ladder:
+                    model.load_weights_with_ladder(
+                        self._get_weights_iteratorV2(model_config.ladder_model_path,
+                                                model_config.revision,
+                                                fall_back_to_pt=getattr(
+                                                    model,
+                                                    "fall_back_to_pt_during_load",
+                                                    True)), )
+                
         return model.eval()
 
     def load_model(self, *, model_config: ModelConfig,
@@ -500,7 +637,6 @@ class TensorizerLoader(BaseModelLoader):
             self.tensorizer_config.tensorizer_uri = \
                 self.tensorizer_config.tensorizer_uri \
                     % get_tensor_model_parallel_rank()
-
         if is_vllm_tensorized(self.tensorizer_config):
             return self._load_model_serialized(model_config, device_config,
                                                lora_config, cache_config)

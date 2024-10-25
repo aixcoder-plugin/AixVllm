@@ -101,8 +101,9 @@ class TensorizerConfig:
 
 
 def load_with_tensorizer(tensorizer_config: TensorizerConfig,
+                         model_config: Optional[ModelConfig],
                          **extra_kwargs) -> nn.Module:
-    tensorizer = TensorizerAgent(tensorizer_config, **extra_kwargs)
+    tensorizer = TensorizerAgent(tensorizer_config, model_config, **extra_kwargs)
     return tensorizer.deserialize()
 
 
@@ -262,6 +263,7 @@ class TensorizerAgent:
     """
 
     def __init__(self, tensorizer_config: TensorizerConfig,
+                 model_config: Optional[ModelConfig],
                  quant_config: QuantizationConfig, **extra_kwargs):
         if tensorizer_error_msg is not None:
             raise ImportError(
@@ -270,6 +272,7 @@ class TensorizerAgent:
                 "Error message: {}".format(tensorizer_error_msg))
 
         self.tensorizer_config = tensorizer_config
+        self.model_config = model_config
         self.tensorizer_args = (
             self.tensorizer_config._construct_tensorizer_args())
         self.extra_kwargs = extra_kwargs
@@ -288,6 +291,8 @@ class TensorizerAgent:
             return self.tensorizer_config.model_class(
                 config=model_args,
                 quant_config=self.quant_config,
+                with_ladder=self.model_config.with_ladder,
+               sub_layers_ids =self.model_config.sub_layers_ids,
                 **self.extra_kwargs)
 
     def _resize_lora_embeddings(self):
@@ -359,6 +364,7 @@ class TensorizerAgent:
 
 
 def tensorizer_weights_iterator(
+    
     tensorizer_args: "TensorizerArgs"
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     logger.warning(

@@ -646,65 +646,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
         params_dict = dict(self.named_parameters())
         weight_dtype = params_dict[next(iter(params_dict.keys()))]
         for name, loaded_weight in weights:
-            if name == 'tok_embeddings.weight':
-                source_name = 'model.embed_tokens.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
-                params_dict[source_name].data = loaded_weight.cuda()
-            elif name == 'output.weight':
-                source_name = 'lm_head.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
-                params_dict[source_name].data = loaded_weight.cuda()
-            elif name == 'norm.weight':
-                source_name = 'model.norm.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
-                params_dict[source_name].data = loaded_weight.cuda()
-            elif name.startswith('layers.') and name.endswith('attention.query_key_value.weight'):
-                layer_id = name.split('.')[1]
-                source_name = 'model.layers.' + layer_id + '.self_attn.qkv_proj.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
-                loaded_weight = qkv_weight_helper.permute_qkv_weights(source_name, loaded_weight)
-                params_dict[source_name].data = loaded_weight.cuda()
-            elif name.startswith('layers.') and name.endswith('feed_forward.w1.weight'):
-                layer_id = name.split('.')[1]
-                source_name = 'model.layers.' + layer_id + '.mlp.gate_up_proj.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name][:14464].shape == loaded_weight.shape, f"{name} shape error"
-                (params_dict[source_name].data)[:14464]  = loaded_weight.cuda()
-            elif name.startswith('layers.') and name.endswith('feed_forward.w3.weight'):
-                layer_id = name.split('.')[1]
-                source_name = 'model.layers.' + layer_id + '.mlp.gate_up_proj.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name][14464:].shape == loaded_weight.shape, f"{name} shape error"
-                (params_dict[source_name].data)[14464:]  = loaded_weight.cuda()
-            elif name.startswith('layers.') and name.endswith('attention.wo.weight'):
-                layer_id = name.split('.')[1]
-                source_name = 'model.layers.' + layer_id + '.self_attn.o_proj.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
-                params_dict[source_name].data = loaded_weight.cuda()
-            elif name.startswith('layers.') and name.endswith('feed_forward.w2.weight'):
-                layer_id = name.split('.')[1]
-                source_name = 'model.layers.' + layer_id + '.mlp.down_proj.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
-                params_dict[source_name].data = loaded_weight.cuda()
-            elif name.startswith('layers.') and name.endswith('attention_norm.weight'):
-                layer_id = name.split('.')[1]
-                source_name = 'model.layers.' + layer_id + '.input_layernorm.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
-                params_dict[source_name].data = loaded_weight.cuda()
-            elif name.startswith('layers.') and name.endswith('ffn_norm.weight'):
-                layer_id = name.split('.')[1]
-                source_name = 'model.layers.' + layer_id + '.post_attention_layernorm.weight'
-                assert source_name in params_dict.keys(), f"{name} is not in params_dict"
-                assert params_dict[source_name].shape == loaded_weight.shape, f"{name} shape error"
-                params_dict[source_name].data = loaded_weight.cuda()
-            elif name == 'merge_gates':
+            if name == 'merge_gates':
                 for layer_id in range(loaded_weight.shape[0]):
                     source_name = 'model.ladder_layers.' + str(layer_id) + '.merge_gates'
                     assert source_name in params_dict.keys(), f"{name} is not in params_dict"

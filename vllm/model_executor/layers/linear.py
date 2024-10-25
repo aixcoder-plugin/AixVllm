@@ -118,7 +118,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                        output_partition_sizes: List[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
-        weight = Parameter(torch.empty(sum(output_partition_sizes),
+        weight = Parameter(torch.zeros(sum(output_partition_sizes),
                                        input_size_per_partition,
                                        dtype=params_dtype),
                            requires_grad=False)
@@ -299,7 +299,6 @@ class ColumnParallelLinear(LinearBase):
 
         if output_sizes is None:
             output_sizes = [output_size]
-
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size,
