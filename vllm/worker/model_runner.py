@@ -1449,7 +1449,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
-        hidden_or_intermediate_states, ladder_hidden_states = model_executable(
+        results = model_executable(
             input_ids=model_input.input_tokens,
             positions=model_input.input_positions,
             kv_caches=kv_caches,
@@ -1458,6 +1458,14 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             **MultiModalInputs.as_kwargs(multi_modal_kwargs,
                                          device=self.device),
             **seqlen_agnostic_kwargs)
+        
+        if isinstance(results, tuple):
+            hidden_or_intermediate_states, ladder_hidden_states = results
+        else:
+            hidden_or_intermediate_states = results
+            ladder_hidden_states = None
+
+        
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
             model_forward_end.record()

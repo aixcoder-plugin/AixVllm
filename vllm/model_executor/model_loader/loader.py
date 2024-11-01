@@ -154,12 +154,18 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                                                     multimodal_config,
                                                     scheduler_config)
 
-    return model_class(config=hf_config,
-                       cache_config=cache_config,
-                       quant_config=quant_config,
-                       with_ladder=with_ladder,
-                       sub_layers_ids=sub_layers_ids,
-                       **extra_kwargs)
+    if with_ladder:
+        return model_class(config=hf_config,
+                        cache_config=cache_config,
+                        quant_config=quant_config,
+                        with_ladder=with_ladder,
+                        sub_layers_ids=sub_layers_ids,
+                        **extra_kwargs)
+    else:
+        return model_class(config=hf_config,
+                        cache_config=cache_config,
+                        quant_config=quant_config,
+                        **extra_kwargs)
 
 
 def _initialize_model(
